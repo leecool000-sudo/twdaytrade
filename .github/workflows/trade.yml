@@ -2,8 +2,15 @@ name: tw-daytrade-paper
 
 on:
   schedule:
-    - cron: "20 8 * * 1-5"
+    # GitHub 用 UTC。台北 08:20 = UTC 00:20,週一到週五。
+    - cron: "20 0 * * 1-5"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "sim = 離線模擬; live = 真實行情"
+        type: choice
+        options: [sim, live]
+        default: sim
 
 jobs:
   run:
