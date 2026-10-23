@@ -1,2 +1,0 @@
-requests>=2.31
-anthropic>=0.40   # 選用:啟用 SOCIAL 的 LLM 新聞判讀
