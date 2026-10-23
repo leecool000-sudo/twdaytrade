@@ -1,0 +1,33 @@
+name: tw-daytrade-paper
+
+on:
+  schedule:
+    - cron: "20 8 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Run paper trading
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_MENTION: ""
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PYTHONUNBUFFERED: "1"
+        run: python main.py --mode live --top 60 2>&1 | tee run.log
+      - name: Save logs and trades
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daytrade-${{ github.run_id }}
+          path: |
+            run.log
+            out/
+          retention-days: 30
