@@ -28,7 +28,7 @@ jobs:
           DISCORD_MENTION: ""
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PYTHONUNBUFFERED: "1"
-        run: python main.py --mode live --top 60 2>&1 | tee run.log
+        run: python main.py --mode "${{ github.event.inputs.mode || 'sim' }}" --top 60 2>&1 | tee run.log
       - name: Save logs and trades
         if: always()
         uses: actions/upload-artifact@v4
