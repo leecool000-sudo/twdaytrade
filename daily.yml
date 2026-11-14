@@ -1,0 +1,31 @@
+name: 處置候選股推播
+
+on:
+  schedule:
+    # 台北時間 週一～五 18:07（UTC 10:07）；注意股通常收盤後傍晚公告
+    - cron: "7 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "指定日期 YYYY-MM-DD（留空=今天）"
+        required: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: 執行選股並推播
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            python tw_disposal_watch.py --date "${{ github.event.inputs.date }}"
+          else
+            python tw_disposal_watch.py
+          fi
