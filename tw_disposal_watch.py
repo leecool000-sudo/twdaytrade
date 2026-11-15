@@ -42,7 +42,7 @@ STOCK_CODE_RE = re.compile(r"^\d{4}$")          # 只看普通股；要含 ETF �
 
 # ───────────────────────── 共用工具 ─────────────────────────
 
-def get_json(url: str, params: dict | None = None, retries: int = 3) -> dict | list:
+def get_json(url: str, params: dict | None = None, retries: int = 4) -> dict | list:
     last = None
     for i in range(retries):
         try:
@@ -51,7 +51,7 @@ def get_json(url: str, params: dict | None = None, retries: int = 3) -> dict | l
             return r.json()
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(2 + i * 3)
+            time.sleep(5 * (2 ** i))  # 證交所限流時回空白頁，退避 5/10/20/40 秒
     raise RuntimeError(f"GET 失敗 {url} {params}: {last}")
 
 
@@ -357,15 +357,26 @@ def daily_bars(c: "Candidate", end: dt.date, months: int = 3) -> list[tuple[dt.d
         except Exception as e:  # noqa: BLE001
             print(f"[warn] {c.code} {cur:%Y-%m} 價格失敗：{e}", file=sys.stderr)
         cur = (cur - dt.timedelta(days=1)).replace(day=1)
-        time.sleep(0.8)  # 證交所有頻率限制，別太快
+        time.sleep(2.0)  # 證交所有頻率限制（約每 5 秒 3 次），別太快
     return [bars[k] for k in sorted(bars)]
 
 
 def enrich_prices(cands: list[Candidate], end: dt.date) -> None:
-    for c in cands:
+    for attempt in range(2):  # 第二輪補抓第一輪失敗的
+        todo = [c for c in cands if not c.price]
+        if not todo:
+            return
+        if attempt:
+            print(f"[info] 補抓 {len(todo)} 檔價格", file=sys.stderr)
+            time.sleep(15)
+        for c in todo:
+            _enrich_one(c, end)
+
+
+def _enrich_one(c: "Candidate", end: dt.date) -> None:
         b = daily_bars(c, end)
         if len(b) < 7 or b[-1][0] != end:
-            continue
+            return
         closes = [x[2] for x in b]
         highs = [x[1] for x in b]
         last, prev = closes[-1], closes[-2]
@@ -383,13 +394,28 @@ def enrich_prices(cands: list[Candidate], end: dt.date) -> None:
         }
 
 
+# ───────────────────────── TradingView ─────────────────────────
+
+def tv_symbol(c: Candidate) -> str:
+    return f"{'TWSE' if c.market == '上市' else 'TPEX'}:{c.code}"
+
+
+def tv_url(c: Candidate) -> str:
+    return f"https://www.tradingview.com/chart/?symbol={tv_symbol(c).replace(':', '%3A')}"
+
+
+def tv_watchlist(cands: list[Candidate], target: dt.date) -> str:
+    """TradingView 觀察清單匯入格式：逗號分隔，### 開頭為分區名稱。"""
+    return ",".join([f"###處置候選_{target:%m%d}"] + [tv_symbol(c) for c in cands])
+
+
 # ───────────────────────── Discord ─────────────────────────
 
 def fmt(c: Candidate) -> str:
     p = c.price
     t = c.today_text
     arrow = "📉跌幅觸發 " if re.search(r"跌幅達", t) and not re.search(r"漲幅達", t) else ""
-    head = f"{arrow}**{c.code} {c.name}**（{c.market}）"
+    head = f"{arrow}[**{c.code} {c.name}**](<{tv_url(c)}>)（{c.market}）"
     if p:
         hi = "｜🔺近60日高點" if p["at_hi60"] else ""
         head += (f"\n收 {p['close']:.2f}（{p['chg']:+.2f}%）｜6日 {p['gain6']:+.1f}%｜"
@@ -409,7 +435,8 @@ def fmt(c: Candidate) -> str:
     return f"{head}\n{body}\n> 今日：{txt}"
 
 
-def push_discord(webhook: str, title: str, blocks: list[str]) -> None:
+def push_discord(webhook: str, title: str, blocks: list[str],
+                 attachment: tuple[str, bytes] | None = None) -> None:
     msgs, cur = [], title
     for b in blocks:
         if len(cur) + len(b) + 2 > 1900:
@@ -418,11 +445,19 @@ def push_discord(webhook: str, title: str, blocks: list[str]) -> None:
         cur += ("\n\n" if cur else "") + b
     if cur:
         msgs.append(cur)
-    for m in msgs:
-        r = requests.post(webhook, json={"content": m, "allowed_mentions": {"parse": []}}, timeout=20)
-        if r.status_code == 429:
+    for i, m in enumerate(msgs):
+        # flags=4：不展開連結預覽，避免每個 TradingView 連結都跑出一大張卡片
+        payload = {"content": m, "allowed_mentions": {"parse": []}, "flags": 4}
+        last = i == len(msgs) - 1
+        for _ in range(3):
+            if last and attachment:   # 附件放在最後一則
+                r = requests.post(webhook, data={"payload_json": json.dumps(payload)},
+                                  files={"files[0]": (attachment[0], attachment[1], "text/plain")}, timeout=30)
+            else:
+                r = requests.post(webhook, json=payload, timeout=20)
+            if r.status_code != 429:
+                break
             time.sleep(float(r.json().get("retry_after", 2)))
-            r = requests.post(webhook, json={"content": m}, timeout=20)
         r.raise_for_status()
         time.sleep(0.6)
 
@@ -468,6 +503,14 @@ def main() -> int:
         with open(a.json, "w", encoding="utf-8") as f:
             json.dump([c.__dict__ for c in cands], f, ensure_ascii=False, indent=2, default=str)
 
+    tv_name = f"tradingview_{target:%Y%m%d}.txt"
+    tv_text = tv_watchlist(cands, target)
+    os.makedirs("output", exist_ok=True)
+    with open(os.path.join("output", tv_name), "w", encoding="utf-8") as f:
+        f.write(tv_text)
+    if cands:
+        blocks.append(f"📎 附件 `{tv_name}`：TradingView 觀察清單 →「匯入清單」即可")
+
     print(title)
     for b in blocks:
         print("\n" + b)
@@ -478,7 +521,7 @@ def main() -> int:
     if not hook:
         print("[error] 未設定 DISCORD_WEBHOOK_URL", file=sys.stderr)
         return 1
-    push_discord(hook, title, blocks)
+    push_discord(hook, title, blocks, (tv_name, tv_text.encode("utf-8")) if cands else None)
     print("[info] 已推播 Discord")
     return 0
 
