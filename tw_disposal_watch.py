@@ -266,9 +266,40 @@ class Candidate:
     hit_today: bool = False   # 今天就已達處置標準（官方公告可能還沒上線）
 
 
-def screen(notices: list[Notice], disposals: list[Disposal], days: list[dt.date]) -> list[Candidate]:
+def gap_codes(notices: list[Notice], days: list[dt.date]) -> dict[str, str]:
+    """今天有注意、但最近 6 日的注意紀錄中間有空檔的股票 → 可能是空檔那天暫停交易，需查個股成交。"""
+    recent = days[-6:]
+    hit: dict[str, set] = defaultdict(set)
+    market = {}
+    for n in notices:
+        if n.date in recent:
+            hit[n.code].add(n.date)
+            market[n.code] = n.market
+    out = {}
+    for code, ds in hit.items():
+        if days[-1] not in ds or len(ds) < 2:
+            continue
+        first = recent.index(min(ds))
+        if any(d not in ds for d in recent[first:]):
+            out[code] = market[code]
+    return out
+
+
+def traded_days(codes: dict[str, str], end: dt.date) -> dict[str, set]:
+    """查個股實際有成交的日子（暫停交易日不算該股的營業日）。"""
+    out = {}
+    for code, mk in codes.items():
+        bars = daily_bars(Candidate(mk, code, "", []), end, months=2)
+        if bars:
+            out[code] = {b[0] for b in bars}
+    return out
+
+
+def screen(notices: list[Notice], disposals: list[Disposal], days: list[dt.date],
+           traded: dict[str, set] | None = None) -> list[Candidate]:
     today = days[-1]
     idx = {d: i for i, d in enumerate(days)}
+    traded = traded or {}
 
     # 最近一次處置公告日：之前的注意次數不再累計；處置中 / 今日公告處置者排除
     last_disp: dict[str, dt.date] = {}
@@ -298,8 +329,10 @@ def screen(notices: list[Notice], disposals: list[Disposal], days: list[dt.date]
     for code, m in by_code.items():
         if code in excluded:
             continue
-        c1 = [bool(m.get(d) and m[d].c1) for d in days]
-        cnt = [bool(m.get(d) and m[d].counted) for d in days]
+        # 用「這檔股票自己有交易的日子」計算連續／次數（櫃買、證交所皆如此）
+        own = [d for d in days if code not in traded or d in traded[code] or d in m]
+        c1 = [bool(m.get(d) and m[d].c1) for d in own]
+        cnt = [bool(m.get(d) and m[d].counted) for d in own]
 
         def streak(arr):
             s = 0
@@ -503,19 +536,25 @@ def main() -> int:
         return 0
     start = days[0]
 
-    notices = []
+    notices, failed = [], []
     for fn, label in ((fetch_twse_notices, "上市"), (fetch_tpex_notices, "上櫃")):
         try:
             got = fn(start, target)
             print(f"[info] {label}注意股紀錄 {len(got)} 筆")
+            if not any(n.date == target for n in got):
+                failed.append(f"{label}今日注意股尚未公告")
             notices += got
         except Exception as e:  # noqa: BLE001
             print(f"[warn] {label}注意股失敗：{e}", file=sys.stderr)
+            failed.append(f"{label}注意股資料抓取失敗")
     if not any(n.date == target for n in notices):
         print("[warn] 今日注意股資料為空，可能尚未公告；稍後再跑。", file=sys.stderr)
 
     disposals = fetch_disposals(start - dt.timedelta(days=45), target)
-    cands = screen(notices, disposals, days)
+    gaps = gap_codes(notices, days)
+    if gaps:
+        print(f"[info] 檢查 {len(gaps)} 檔是否有暫停交易日：{','.join(gaps)}", file=sys.stderr)
+    cands = screen(notices, disposals, days, traded_days(gaps, target))
     if cands and not a.no_price:
         enrich_prices([c for c in cands if not c.hit_today], target)
 
@@ -523,6 +562,8 @@ def main() -> int:
     cands = [c for c in cands if not c.hit_today]
     title = (f"📢 **{target:%Y/%m/%d} 明日再注意即處置｜共 {len(cands)} 檔**\n"
              f"_條件：連3日第一款／連5日／10日6次／30日12次 差一天_")
+    if failed:
+        title += "\n⚠️ **名單不完整：" + "、".join(failed) + "**（可到 GitHub Actions 手動重跑）"
     blocks = [fmt(c) for c in cands] or ["今日沒有符合條件的個股。"]
     if hits:
         blocks.append("⛔ **今日已達處置標準（下一交易日起處置，官方公告可能稍晚）**\n"
