@@ -263,6 +263,7 @@ class Candidate:
     cnt10: int = 0
     cnt30: int = 0
     price: dict = field(default_factory=dict)
+    hit_today: bool = False   # 今天就已達處置標準（官方公告可能還沒上線）
 
 
 def screen(notices: list[Notice], disposals: list[Disposal], days: list[dt.date]) -> list[Candidate]:
@@ -310,6 +311,23 @@ def screen(notices: list[Notice], disposals: list[Disposal], days: list[dt.date]
 
         s1, sa = streak(c1), streak(cnt)
         n9, n29 = sum(cnt[-9:]), sum(cnt[-29:])
+        n10, n30 = sum(cnt[-10:]), sum(cnt[-30:])
+        hit = []
+        if s1 >= 3:
+            hit.append(f"第一款已連 {s1} 日")
+        if sa >= 5:
+            hit.append(f"已連續 {sa} 日注意")
+        if n10 >= 6:
+            hit.append(f"10 日內 {n10} 次")
+        if n30 >= 12:
+            hit.append(f"30 日內 {n30} 次")
+        info = meta[code]
+        tn = m.get(today)
+        if hit:  # 今天已達標 → 下一個交易日起處置，不算「差一天」
+            out.append(Candidate(info.market, code, info.name, hit,
+                                 tn.text if tn else "", tn.close if tn else None,
+                                 s1, sa, n10, n30, hit_today=True))
+            continue
         reasons = []
         if s1 >= 2:
             reasons.append(f"第一款已連 {s1} 日 → 明日第一款即「連 3 日」")
@@ -321,13 +339,11 @@ def screen(notices: list[Notice], disposals: list[Disposal], days: list[dt.date]
             reasons.append(f"近 29 日已 {n29} 次 → 明日即「30 日 12 次」")
         if not reasons:
             continue
-        info = meta[code]
-        tn = m.get(today)
         out.append(Candidate(info.market, code, info.name, reasons,
                              tn.text if tn else "（今日未列注意）",
                              tn.close if tn else None, s1, sa, n9, n29))
     # 第一款連 2 日的最優先（最常是「隔天拉一根」的型態）
-    out.sort(key=lambda c: (-(c.streak_c1 >= 2), -c.streak_all, -c.cnt10, c.code))
+    out.sort(key=lambda c: (c.hit_today, -(c.streak_c1 >= 2), -c.streak_all, -c.cnt10, c.code))
     return out
 
 
@@ -411,11 +427,19 @@ def tv_watchlist(cands: list[Candidate], target: dt.date) -> str:
 
 # ───────────────────────── Discord ─────────────────────────
 
+def md(s: str) -> str:
+    return re.sub(r"([*_~`|\\\[\]])", r"\\\1", s)
+
+
+def fmt_hit(c: Candidate) -> str:
+    return f"[{c.code} {md(c.name)}](<{tv_url(c)}>)（{c.market}）：{'、'.join(c.reasons)}"
+
+
 def fmt(c: Candidate) -> str:
     p = c.price
     t = c.today_text
     arrow = "📉跌幅觸發 " if re.search(r"跌幅達", t) and not re.search(r"漲幅達", t) else ""
-    head = f"{arrow}[**{c.code} {c.name}**](<{tv_url(c)}>)（{c.market}）"
+    head = f"{arrow}[**{c.code} {md(c.name)}**](<{tv_url(c)}>)（{c.market}）"
     if p:
         hi = "｜🔺近60日高點" if p["at_hi60"] else ""
         head += (f"\n收 {p['close']:.2f}（{p['chg']:+.2f}%）｜6日 {p['gain6']:+.1f}%｜"
@@ -493,11 +517,16 @@ def main() -> int:
     disposals = fetch_disposals(start - dt.timedelta(days=45), target)
     cands = screen(notices, disposals, days)
     if cands and not a.no_price:
-        enrich_prices(cands, target)
+        enrich_prices([c for c in cands if not c.hit_today], target)
 
+    hits = [c for c in cands if c.hit_today]
+    cands = [c for c in cands if not c.hit_today]
     title = (f"📢 **{target:%Y/%m/%d} 明日再注意即處置｜共 {len(cands)} 檔**\n"
              f"_條件：連3日第一款／連5日／10日6次／30日12次 差一天_")
     blocks = [fmt(c) for c in cands] or ["今日沒有符合條件的個股。"]
+    if hits:
+        blocks.append("⛔ **今日已達處置標準（下一交易日起處置，官方公告可能稍晚）**\n"
+                      + "\n".join("• " + fmt_hit(c) for c in hits))
 
     if a.json:
         with open(a.json, "w", encoding="utf-8") as f:
